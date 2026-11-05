@@ -71,6 +71,9 @@ public class RemoteEngineBuilder {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RemoteEngineBuilder.class);
     private static final String RECONNECT_METRIC_ID = "extender.service.remoteBuilder.reconnect";
+    // Router-side outcome of a remote build: the builder's extender.build.task counter reports
+    // success even when the router later loses the result.
+    private static final String REMOTE_BUILD_METRIC_ID = "extender.remote.build";
     private static final int MAX_ERROR_BODY_LENGTH = 200;
 
     private GCPInstanceService instanceService;
@@ -225,6 +228,7 @@ public class RemoteEngineBuilder {
                 Thread.sleep(buildSleepTimeout);
                 while (System.currentTimeMillis() - currentTime < buildResultWaitTimeout) {
                     touchInstance(remoteInstanceConfig.getInstanceId());
+                    keepResultDirAlive(resultDir);
                     HttpGet statusRequest = new HttpGet(String.format("%s/job_status?jobId=%s", remoteInstanceConfig.getUrl(), jobId));
                     try (CloseableHttpResponse statusResponse = httpClient.execute(statusRequest)) {
                         int statusCode = statusResponse.getStatusLine().getStatusCode();
@@ -281,6 +285,7 @@ public class RemoteEngineBuilder {
             File buildResult = new File(resultDir, BuilderConstants.BUILD_RESULT_FILENAME);
             boolean successful = buildResult.exists();
             progressReporter.terminal(successful, successful ? "Build succeeded" : "Build failed");
+            countRemoteBuild(remoteInstanceConfig, successful);
             tmpUploadArchive.delete();
             metricsWriter.measureRemoteEngineBuild(buildTimer.start(), platform);
             // Delete temporary upload directory
@@ -301,9 +306,36 @@ public class RemoteEngineBuilder {
         void write(PrintWriter writer) throws IOException;
     }
 
+    // AsyncBuilder.cleanUnusedResults deletes result dirs older than extender.job-result.lifetime by
+    // mtime. Nothing is written here until the builder finishes, so refresh the mtime while polling
+    // or a build that outlives the lifetime loses its dir before the result arrives.
+    private static void keepResultDirAlive(File resultDir) {
+        if (!resultDir.setLastModified(System.currentTimeMillis())) {
+            LOGGER.warn("Failed to refresh result directory {}", resultDir);
+        }
+    }
+
+    // The dir can still disappear (lifetime shorter than one poll, manual cleanup); recreate it so the
+    // result or diagnostic is stored instead of failing the finished build with FileNotFoundException.
+    private static void ensureResultDir(File resultDir) throws IOException {
+        Files.createDirectories(resultDir.toPath());
+    }
+
+    private void countRemoteBuild(RemoteInstanceConfig remoteInstanceConfig, boolean successful) {
+        String host;
+        try {
+            host = URIUtils.extractHost(URI.create(remoteInstanceConfig.getUrl())).toHostString();
+        } catch (Exception e) {
+            host = "unknown";
+        }
+        MetricsWriter.metricsCounterIncrement(meterRegistry, REMOTE_BUILD_METRIC_ID,
+            "host", host, "success", Boolean.toString(successful));
+    }
+
     // error.txt makes /job_status report ERROR and /job_result serve its content, so it must not be
     // visible before it is complete. Same temporary file and atomic move as build.zip.
     private static void writeErrorFile(File resultDir, ErrorBody body) throws IOException {
+        ensureResultDir(resultDir);
         File tmpError = new File(resultDir, BuilderConstants.BUILD_ERROR_FILENAME + ".tmp");
         try (PrintWriter writer = new PrintWriter(tmpError)) {
             body.write(writer);
@@ -332,6 +364,7 @@ public class RemoteEngineBuilder {
                 }
                 if (jobStatus == BuilderConstants.JobStatus.SUCCESS.ordinal()) {
                     // Write zip file to result directory
+                    ensureResultDir(resultDir);
                     File tmpResult = new File(resultDir, BuilderConstants.BUILD_RESULT_FILENAME + ".tmp");
                     try (OutputStream os = new FileOutputStream(tmpResult)) {
                         IOUtils.copy(resultResponse.getEntity().getContent(), os);

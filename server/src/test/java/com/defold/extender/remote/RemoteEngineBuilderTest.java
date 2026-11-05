@@ -33,6 +33,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
@@ -46,8 +48,10 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.http.HttpEntity;
 
+import com.defold.extender.AsyncBuilder;
 import com.defold.extender.BuilderConstants;
 import com.defold.extender.ExtenderConst;
 import com.defold.extender.ExtenderException;
@@ -164,15 +168,32 @@ public class RemoteEngineBuilderTest {
     }
 
     private Path submitBuild(RemoteEngineBuilder builder, String jobName) throws Exception {
+        submitBuildFuture(builder, jobName);
+        return resultLocation.resolve("job_" + jobName);
+    }
+
+    // The future completes when buildAsync returns, and fails if it threw.
+    private Future<?> submitBuildFuture(RemoteEngineBuilder builder, String jobName) throws Exception {
         Path projectDirectory = Files.createDirectories(tmpDir.resolve(jobName).resolve("upload"));
         Files.writeString(projectDirectory.resolve("main.cpp"), "int main() { return 0; }");
         File jobDirectory = Files.createDirectories(tmpDir.resolve(jobName).resolve("job_" + jobName)).toFile();
-        executor.submit(() -> {
+        return executor.submit(() -> {
             builder.buildAsync(mockInstanceConfig(), projectDirectory.toFile(), "arm64-ios", "testsdk",
                 jobDirectory, new MetricsWriter(new SimpleMeterRegistry()));
             return null;
         });
-        return resultLocation.resolve(jobDirectory.getName());
+    }
+
+    // Runs the production result sweep against this test's result location.
+    private AsyncBuilder resultCleaner(long resultLifetime) {
+        return new AsyncBuilder(null, null, Optional.empty(), Optional.empty(),
+            new BuildProgressService(false, 1000, 16, 4, 1000), null,
+            resultLocation.toString(), resultLifetime);
+    }
+
+    private double remoteBuildCount(String success) {
+        return meterRegistry.counter("extender.remote.build",
+            "host", "localhost:" + builderMock.port(), "success", success).count();
     }
 
     private int receivedBuildRequests() {
@@ -455,6 +476,142 @@ public class RemoteEngineBuilderTest {
 
         assertTrue(errorFileAppears(resultDir));
         assertEquals(compilerOutput, readError(resultDir));
+    }
+
+    // A remote build that outlives extender.job-result.lifetime must not have its result dir swept
+    // by AsyncBuilder.cleanUnusedResults while polling: the dir is only written once the builder
+    // finishes, so the sweep saw it as stale and deleted it, then the download failed on
+    // build.zip.tmp (FileNotFoundException) and the finished build was lost.
+    @Test
+    @Timeout(60)
+    public void longRunningRemoteBuildKeepsResultDirAliveAgainstCleanup() throws Exception {
+        final byte[] resultZip = new byte[] {0x50, 0x4b, 0x03, 0x04, 0x42};
+        builderMock.stubFor(post(urlPathMatching("/build_async/.*"))
+                .willReturn(aResponse().withStatus(200).withBody("long-job")));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("long build")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(aResponse().withStatus(200)
+                        .withBody(String.valueOf(BuilderConstants.JobStatus.NOT_FOUND.ordinal()))));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("long build")
+                .whenScenarioStateIs("done")
+                .willReturn(aResponse().withStatus(200)
+                        .withBody(String.valueOf(BuilderConstants.JobStatus.SUCCESS.ordinal()))));
+        builderMock.stubFor(get(urlPathEqualTo("/job_result"))
+                .willReturn(aResponse().withStatus(200).withBody(resultZip)));
+
+        // Lifetime far shorter than the build, like the 20 min default against a 40 min wait timeout
+        long resultLifetime = 1_000;
+        AsyncBuilder cleaner = resultCleaner(resultLifetime);
+        Path resultDir = submitBuild(createBuilder(1), "long");
+        assertTrue(waitFor(() -> resultDir.toFile().isDirectory(), 5_000));
+
+        // Keep sweeping while the build is "running" for several lifetimes
+        long runningUntil = System.currentTimeMillis() + 3 * resultLifetime;
+        while (System.currentTimeMillis() < runningUntil) {
+            cleaner.cleanUnusedResults();
+            Thread.sleep(BUILD_SLEEP_TIMEOUT);
+        }
+        assertTrue(resultDir.toFile().isDirectory(),
+            "cleanUnusedResults deleted the result dir of a remote build that was still polling");
+
+        builderMock.setScenarioState("long build", "done");
+        Path buildResult = resultDir.resolve(BuilderConstants.BUILD_RESULT_FILENAME);
+        assertTrue(waitFor(() -> buildResult.toFile().exists(), 15_000),
+            "The finished build's result was not stored after the long wait");
+        assertArrayEquals(resultZip, Files.readAllBytes(buildResult));
+    }
+
+    // If the result dir is gone anyway (lifetime misconfigured, manual cleanup), buildAsync must still
+    // store what the builder returns and never die with an uncaught exception: the catch-all used to
+    // write error.txt into the missing dir and throw out of the @Async method, so the client got
+    // neither a result nor an error.
+    @Test
+    @Timeout(60)
+    public void resultDirDeletedDuringBuildStillDeliversResult() throws Exception {
+        final byte[] resultZip = new byte[] {0x50, 0x4b, 0x03, 0x04, 0x42};
+        builderMock.stubFor(post(urlPathMatching("/build_async/.*"))
+                .willReturn(aResponse().withStatus(200).withBody("swept-job")));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("swept")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(aResponse().withStatus(200)
+                        .withBody(String.valueOf(BuilderConstants.JobStatus.NOT_FOUND.ordinal()))));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("swept")
+                .whenScenarioStateIs("done")
+                .willReturn(aResponse().withStatus(200)
+                        .withBody(String.valueOf(BuilderConstants.JobStatus.SUCCESS.ordinal()))));
+        builderMock.stubFor(get(urlPathEqualTo("/job_result"))
+                .willReturn(aResponse().withStatus(200).withBody(resultZip)));
+
+        RemoteEngineBuilder builder = createBuilder(1);
+        Path resultDir = resultLocation.resolve("job_swept");
+        Future<?> build = submitBuildFuture(builder, "swept");
+        assertTrue(waitFor(() -> resultDir.toFile().isDirectory(), 5_000));
+        FileUtils.deleteDirectory(resultDir.toFile());
+        builderMock.setScenarioState("swept", "done");
+
+        build.get(30, TimeUnit.SECONDS);
+        Path buildResult = resultDir.resolve(BuilderConstants.BUILD_RESULT_FILENAME);
+        assertTrue(buildResult.toFile().exists(), "The result must be stored although its dir was deleted mid-build");
+        assertArrayEquals(resultZip, Files.readAllBytes(buildResult));
+    }
+
+    // When the error path itself finds the result dir gone, the client must still get error.txt.
+    @Test
+    @Timeout(60)
+    public void resultDirDeletedBeforeErrorStillWritesErrorFile() throws Exception {
+        builderMock.stubFor(post(urlPathMatching("/build_async/.*"))
+                .willReturn(aResponse().withStatus(200).withBody("swept-error-job")));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("swept error")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(aResponse().withStatus(200)
+                        .withBody(String.valueOf(BuilderConstants.JobStatus.NOT_FOUND.ordinal()))));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status")).inScenario("swept error")
+                .whenScenarioStateIs("broken")
+                .willReturn(aResponse().withStatus(500)));
+
+        RemoteEngineBuilder builder = createBuilder(1);
+        Path resultDir = resultLocation.resolve("job_swept-error");
+        Future<?> build = submitBuildFuture(builder, "swept-error");
+        assertTrue(waitFor(() -> resultDir.toFile().isDirectory(), 5_000));
+        FileUtils.deleteDirectory(resultDir.toFile());
+        builderMock.setScenarioState("swept error", "broken");
+
+        build.get(30, TimeUnit.SECONDS);
+        assertTrue(resultDir.resolve(BuilderConstants.BUILD_ERROR_FILENAME).toFile().exists(),
+            "error.txt must be written although the result dir was deleted mid-build");
+        assertTrue(readError(resultDir).contains("HTTP 500"), "was: " + readError(resultDir));
+    }
+
+    // A remote build that ends without build.zip is a router-side failure the builder's own
+    // extender.build.task counter never sees (it reports the build as successful). Count it on the
+    // router so these failures show up in metrics.
+    @Test
+    @Timeout(60)
+    public void remoteBuildOutcomeIsCountedOnTheRouter() throws Exception {
+        builderMock.stubFor(post(urlPathMatching("/build_async/.*"))
+                .willReturn(aResponse().withStatus(200).withBody("counted-job")));
+        builderMock.stubFor(get(urlPathEqualTo("/job_status"))
+                .willReturn(aResponse().withStatus(500)));
+        RemoteEngineBuilder builder = createBuilder(1);
+
+        submitBuildFuture(builder, "counted").get(30, TimeUnit.SECONDS);
+
+        assertEquals(1.0, remoteBuildCount("false"), "A remote build without a result must be counted as failed");
+        assertEquals(0.0, remoteBuildCount("true"));
+    }
+
+    @Test
+    @Timeout(60)
+    public void successfulRemoteBuildIsCountedOnTheRouter() throws Exception {
+        stubSuccessfulJobPipeline("counted-ok-job");
+        builderMock.stubFor(get(urlPathEqualTo("/job_result"))
+                .willReturn(aResponse().withStatus(200).withBody(new byte[] {0x50, 0x4b, 0x03, 0x04})));
+        RemoteEngineBuilder builder = createBuilder(1);
+
+        submitBuildFuture(builder, "counted-ok").get(30, TimeUnit.SECONDS);
+
+        assertEquals(1.0, remoteBuildCount("true"));
+        assertEquals(0.0, remoteBuildCount("false"));
     }
 
     // Keeping a suspendable instance awake is best-effort: a failing touchInstance is swallowed so
